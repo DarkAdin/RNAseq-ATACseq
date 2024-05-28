@@ -1,0 +1,987 @@
+---
+title: Dataset Betsholtz cerebro murino
+author: Adán Somoza López
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: "paged"
+    toc: true
+    toc_depth: 3
+vignette: >
+  %\VignetteIndexEntry{Basic tutorial}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Cargar los datos
+
+```{R}
+library(data.table)
+library(SCopeLoomR)
+```
+
+```{R}
+# Betsholtz brain Mmus
+fichero <- "../../grnboost/GSE98816_Betsholtz_brain_no_norm.txt"
+tipos_celulares <- read.csv('../../grnboost/cels_brain_mmus_holtz', header = FALSE)
+
+# Betsholtz lung Mmus
+#fichero <- '../../grnboost/GSE99235_Lung_samples_Mmus_raw_reads_counts_matrix.txt'
+#tipos_celulares <- read.csv('int/tipos_celulares', header = FALSE)
+
+# Kidney Mmus (todos los pericitos + 200 células aleatorias de cada grupo restante)
+#fichero <- 'KidneySampleado.csv'
+#tipos_celulares <- read.csv('tipos_celulares', header = FALSE)
+```
+
+Si el fichero tiene formato _loom_ o si es RDS, cargarlo consecuentemente.
+
+```{R}
+if (!file.exists("int/ExprMat.loom")) {
+
+    dir.create("int")
+
+    # If it is TSV/CSV
+    datos <- read.csv (
+        fichero,
+        header = TRUE,
+        sep = ',',
+        row.names = 1
+    )
+    exprMat <- as.matrix(datos)
+
+    # If it is RDS
+    datos <- readRDS (fichero)
+    exprMat <- as.matrix(datos)
+
+    loom <- build_loom (
+        "int/ExprMat.loom",
+        dgem = exprMat
+    )
+
+    rm(datos)
+
+    close_loom(loom)
+
+    gc()
+} 
+```
+
+```{R}
+loom <- open_loom ("int/ExprMat.loom")
+
+exprMat <- get_dgem (loom)
+NombresGenes <- rownames (exprMat)
+cellInfo <- get_cell_annotation (loom)
+
+# Añadir clase celular
+cellInfo$Class <- tipos_celulares$V1
+
+saveRDS (NombresGenes, "int/NombresGenes.Rds")
+saveRDS (cellInfo, "int/cellInfo.Rds")
+
+close_loom(loom)
+```
+
+# SCENIC
+
+## Condiciones iniciales del análisis
+
+```{R}
+library(SCENIC)
+
+# Mmus
+#dbs <- c( '500bp' = "mm10__refseq-r80__10kb_up_and_down_tss.mc9nr.feather",
+#    '10kb' = "mm10__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather"
+#    )
+
+# Hsapiens
+#dbs <- c (
+#    '500pb' = 'hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather',
+#    '10kb' = 'hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather'
+#)
+
+if (!file.exists('int/scenicOptions.Rds')) {
+    print ('Creando objeto scenicOptions.Rds')
+    scenicOptions <- initializeScenic (
+        org = "mgi", # Ratón
+        #org = "hgnc", # Humano
+        dbDir = "cisTarget_databases",
+        #dbs = dbs,
+        nCores = 4
+    )
+} else {
+    print ('scenicOptions.Rds ya existe')
+    scenicOptions <- readRDS ('int/scenicOptions.Rds')
+}
+
+scenicOptions@inputDatasetInfo$cellInfo <- "int/cellInfo.Rds"
+
+saveRDS(
+    cellInfo,
+    file=getDatasetInfo(scenicOptions, "cellInfo")
+) # Temporary, to add to loom
+
+## CHECKPOINT
+saveRDS (scenicOptions, file="int/scenicOptions.Rds") 
+```
+
+## Filtrado de genes
+
+```{R}
+if (!file.exists('int/genesKept.Rds')) {
+    genesKept <- geneFiltering(
+        exprMat,
+        scenicOptions = scenicOptions,
+        # Mínimo contaje por gen
+        minCountsPerGene = 3 * 0.01 * ncol (exprMat),
+        # Número mínimo de células que lo tengan detectable
+        minSamples = ncol (exprMat) * 0.01 # 1% células
+    )
+    saveRDS (genesKept, 'int/genesKept.Rds')
+} else {
+    genesKept <- readRDS ('int/genesKept.Rds')
+}
+
+exprMat_filtered <- exprMat[genesKept,]
+
+rm(genesKept)
+gc()
+```
+
+## Matriz de correlación
+
+```{R}
+if (!file.exists("int/1.2_corrMat.Rds")) {
+    print ('Generando matriz de correlación')
+    runCorrelation (
+        exprMat_filtered,
+        scenicOptions
+    )
+}
+
+if (!file.exists("int/exprMat_filtered_log.Rds")) {
+    exprMat_filtered_log <- log2 (exprMat_filtered + 1)
+    saveRDS (exprMat_filtered_log, file = "int/exprMat_filtered_log.Rds")
+} else {
+    exprMat_filtered_log <- readRDS ("int/exprMat_filtered_log.Rds")
+}
+```
+## GENIE3 / GRNBOOST2
+
+Generación de la _linklist_, una matriz con factores de transcripción, sus dianas, y una puntuación de dicha relación.
+
+```{R}
+#Subsampling cells: When there is a high proportion of low-quality cells, or if the computation time is an issue, it is also possible to infer the regulatory network using a subset of cells (e.g. selecting random or high-quality cells as input to the co-expression analysis). The activity of the regulatory network, trained on this subset of cells, can then be evaluated on all the cells in the dataset with AUCell (Step 3). Note that to avoid loss of resolution, the subset of cells should be representative of the whole dataset (e.g. contain sufficient representation of all the cell types). Examples of this approach are presented in @aibar2017 (i.e. subsampling this mouse brain dataset, and the analysis of 49k cells from mouse retina).
+
+##############################################
+## GENIE3 (deprecado en favor de GRNBOOST2) ##
+##############################################
+#scoring <- runGenie3 (
+#      exprMat_filtered_log,
+#      scenicOptions,
+#      #nParts = 99999,
+#      nParts = 40,
+#      # Continuar desde la última parte
+#      resumePreviousRun = FALSE
+#)
+#saveRDS(scenicOptions, file="int/scenicOptions.Rds") 
+#rm (exprMat_filtered_log)
+
+##############
+## GRNBOOST ##
+##############
+
+# Prepare for grnboost
+if (!file.exists('int/1.4_GENIE3_linkList.Rds')) {
+    if (!file.exists('int/1.1_exprMatrix_filtered_t.txt') && !file.exists('int/1.1_inputTFs.txt')) {
+        exportsForArboreto (
+            exprMat_filtered_log,
+            scenicOptions,
+            dir = 'int'
+        )
+    }
+    if (!file.exists('int/para_grnboost.loom')) {
+        loom <- build_loom (
+            "int/para_grnboost.loom",
+            dgem = exprMat_filtered_log
+        )
+        close_loom (loom)
+    }
+
+    # Launch grnboost
+    if (!file.exists('int/1.4_GENIE3_linkList.Rds') && !file.exists('int/Salida_grnboost.tsv')) {
+        print ('INICIANDO GRNBOOST2...')
+        system ('./arboreto_with_multiprocessing.py int/para_grnboost.loom int/1.1_inputTFs.txt --method grnboost2 --output int/Salida_grnboost.tsv --num_workers 8 --seed 6969')
+    }
+
+    # Save its output
+    if (!file.exists("int/1.4_GENIE3_linkList.Rds")) {
+
+        # Rename the two offending columns
+        system ("sed -i 's/importance/weight/g' int/Salida_grnboost.tsv")
+        system ("sed -i 's/target/Target/g' int/Salida_grnboost.tsv")
+
+        grnboost_salida <- read.csv (
+            'int/Salida_grnboost.tsv',
+            sep = '\t',
+        )
+
+        # Save the output with the name SCENIC expects
+        saveRDS(grnboost_salida, "int/1.4_GENIE3_linkList.Rds")
+        rm(grnboost_salida)
+        gc()
+    }
+}
+```
+
+## SCENIC 1
+
+Convertir la salida de GENIE3/GRNBOOST a módulos de coexpresión.
+
+```{R}
+##############
+## SCENIC 1 ##
+##############
+# Convertir el output de GENIE3/GRNBOOST a módulos de coexpresión
+if (scenicOptions@status$current < 1) {
+    print ('Iniciando SCENIC 1')
+    scenicOptions <- runSCENIC_1_coexNetwork2modules(
+        scenicOptions,
+        weightCol = "weight",
+        # Esto no hace falta en principio, los detecta solo
+        #linkList = linkList,
+        #corrMat = corrMat,
+        weightThreshold = 0.15
+        )
+    saveRDS(scenicOptions, file="int/scenicOptions.Rds") 
+}
+
+gc()
+```
+## SCENIC 2
+
+Creación de regulones y localización de ellos respecto al TSS.
+
+```{R}
+##############
+## SCENIC 2 ##
+##############
+if (scenicOptions@status$current < 2) {
+    print ('Iniciando SCENIC 2')
+
+    ## ELEGIR ZONA GENÓMICA
+    # Se analizan ambas zonas por defecto
+    #scenicOptions@settings$dbs <- scenicOptions@settings$dbs["10kb"] # 10 kb alrededor del TSS (20 kb)
+    #scenicOptions@settings$dbs <- scenicOptions@settings$dbs["500bp"] # 500 bp upstream del TSS
+
+    # 4.2.2 Método de puntuación
+    scenicOptions <- runSCENIC_2_createRegulons(
+        scenicOptions,
+        #minGenes = 20,
+        minGenes = 3,
+        #minJakkardInd = 0.8,
+        #signifGenesMethod = "aprox",
+        signifGenesMethod = "iCisTarget",
+            # "iCisTarget"
+            # "iCisTargetAprox"
+        onlyPositiveCorr = FALSE,
+        #onlyBestGsPerMotif = FALSE,
+        #dbIndexCol = "features",
+        #coexMethod = "top10perTarget"
+    )
+    saveRDS(scenicOptions, file="int/scenicOptions.Rds") 
+}
+
+gc()
+
+```
+## SCENIC 3
+
+Puntuar cada regulón célula a célula.
+
+```{R}
+##############
+## SCENIC 3 ##
+##############
+if (scenicOptions@status$current < 3) {
+
+    print ('Iniciando SCENIC 3')
+
+    # 4.2.3 Puntuación de células. Escribe en int y output
+    # Añadir los genes como nombres de fila porque si no, no los encuentra si se reanuda desde aquí
+    #rownames(exprMat_log) <- readRDS ("int/NombresGenes.Rds")
+    #rownames(exprMat_filtered_log) <- readRDS ("int/NombresGenes.Rds")
+    scenicOptions <- runSCENIC_3_scoreCells(
+        scenicOptions,
+        #exprMat_log, # exprMat_filtered_log no?
+        exprMat_filtered_log,
+        skipBinaryThresholds = FALSE,
+        skipHeatmap = FALSE,
+        skipTsne = FALSE
+    )
+    saveRDS(scenicOptions, file="int/scenicOptions.Rds") 
+}
+
+gc()
+```
+## SCENIC 4
+
+Binarización de regulones: extremizar su expresión en _activo/inactivo_.
+
+```{R}
+##############
+## SCENIC 4 ##
+##############
+if (scenicOptions@status$current < 4) {
+
+    print ('Iniciando SCENIC 4')
+
+    scenicOptions <- runSCENIC_4_aucell_binarize(scenicOptions)
+    saveRDS(scenicOptions, file="int/scenicOptions.Rds") 
+} else {
+    print ('Scenic ya finalizado.')
+}
+
+gc()
+```
+
+# t-SNE
+
+```{R}
+##########
+## tSNE ##
+##########
+# Esto va directo al LOOM
+
+if (!file.exists('int/tSNE_AUC_50pcs_100perpl.Rds')) {
+    ## Perplejidades
+    perps <- c (15, 30, 50, 75, 100)
+    # Componentes
+    pcs <- c (5, 10, 15, 20, 30)
+    for (i in seq(length(perps))) {
+        tsneAUC(
+            scenicOptions,
+            aucType = "AUC",
+            #onlyHighConf = TRUE,
+            #nPcs = pcs[i],
+            perpl = perps[i],
+            seed = 6969
+        )
+        tsneAUC(
+            scenicOptions,
+            aucType = "Binary",
+            #onlyHighConf = TRUE,
+            #nPcs = pcs[i],
+            perpl = perps[i],
+            seed = 6969
+        )
+    }
+}
+```
+
+Representación del clústering junto con los grupos celulares indicados por los autores.
+
+```{R}
+cels <- read.csv ('int/cels', header = FALSE)
+clusters <- readRDS ('int/tSNE_AUC_30pcs_30perpl.Rds')
+plot (clusters$Y, col = factor(cels$V1), pch = 19, main = 'tSNE')
+legend (x = 'topright', legend = unique (cels$V1), col = factor (unique(cels$V1)), pch = 19)
+```
+
+# Guardar resultados (loom)
+
+```{R}
+##################
+## GUARDAR LOOM ##
+##################
+
+if (!file.exists("output/scenic.loom")) {
+    rownames(exprMat) <- readRDS ("int/NombresGenes.Rds")
+    export2loom(
+        scenicOptions,
+        exprMat,
+        addAllTsnes = TRUE
+    )
+
+    ## Renombrarlo para que no lo pise
+    system ('mv output/scenic.loom output/ScenicExprMatOutput.loom')
+
+    if (!file.exists("output/scenic.loom")) {
+        rownames(exprMat) <- readRDS ("int/NombresGenes.Rds")
+        export2loom(
+            scenicOptions,
+            exprMat,
+            addAllTsnes = TRUE
+        )
+    }
+
+    saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+}
+```
+
+# Explorar los resultados
+
+## Regulon Specificity Score
+
+```{R}
+#motifEnrichment_selfMotifs_wGenes <- loadInt(scenicOptions, "motifEnrichment_selfMotifs_wGenes")
+#tableSubset <- motifEnrichment_selfMotifs_wGenes[highlightedTFs=="Sox8"]
+#viewMotifs(tableSubset)
+
+#tableSubset <- motifEnrichment_selfMotifs_wGenes[highConfAnnot==TRUE]
+#viewMotifs(tableSubset)
+#viewMotifs(motifEnrichment_selfMotifs_wGenes)
+
+# output/Step2_regulonTargetsInfo.tsv in detail: 
+regulonTargetsInfo <- loadInt(scenicOptions, "regulonTargetsInfo")
+
+#add_regulons(
+#    loom = open_loom ("output/scenic.loom", mode = 'r+'),
+#    column.attr.name = "MotifRegulons2",
+#    regulonTargetsInfo
+#)
+#
+#add_regulons(
+#    loom = open_loom ("output/ScenicExprMatOutput.loom", mode = 'r+'),
+#    column.attr.name = "MotifRegulons2",
+#    regulonTargetsInfo
+#)
+
+#regulon_plotExpression(
+#    exprMat_filtered_log,
+#    nCells = ncol(exprMat_filtered_log),
+#    cellInfo = tipos_celulares
+#)
+
+# Cell-type specific regulators (RSS o regulon specificity score): 
+if (!file.exists ('rss') && !file.exists('rssPlot')) {
+    library(AUCell)
+    regulonAUC <- loadInt(scenicOptions, "aucell_regulonAUC")
+    rss <- calcRSS(
+        AUC = getAUC(regulonAUC),
+        cellAnnotation = tipos_celulares$V1
+    )
+    saveRDS (rss, file = 'rss')
+    rssPlot <- plotRSS(
+        rss,
+        zThreshold = 3,
+        cluster_columns = FALSE,
+        order_rows = TRUE,
+        thr = 3,
+        #thr = 15,
+        varName = "cellType",
+        col.low = "red",
+        col.mid = "yellow",
+        col.high = "green",
+        revCol = FALSE,
+        verbose = TRUE
+    )
+    saveRDS (rssPlot, file = 'rssPlot')
+} else {
+    rss <- readRDS ('rss')
+    rssPlot <- readRDS ('rssPlot')
+}
+plot (rssPlot $ plot)
+```
+Gráfica interactiva:
+```{R}
+plotly::ggplotly(rssPlot$plot)
+```
+
+## SEURAT
+
+```{R}
+library(Seurat)
+
+if (!dir.exists('seurat')) {
+    dir.create('seurat')
+}
+
+## Convertir matriz a objeto seurat
+if (!file.exists('seurat/seuratmat.Rds')) {
+
+    # Si RDS
+    #datos <- readRDS ('int/exprMat_filtered_log.Rds') # Debe trasponerse
+    #seuratmat <- CreateSeuratObject (
+    #    t(datos), # Aquí se traspone
+    #    min.cells = 2,
+    #    min.features = 300
+    #)
+
+    # Si LOOM
+    #library(SCopeLoomR)
+    datos <- get_dgem ( open_loom ('int/ExprMat.loom') )
+    seuratmat <- CreateSeuratObject (
+        datos,
+        #min.cells = 2,
+        #min.features = 300
+    )
+
+    rm(datos)
+    gc()
+
+    # Normalizar
+    seuratmat <- NormalizeData(seuratmat)
+    genes <- rownames (seuratmat)
+    seuratmat <- ScaleData(seuratmat, features = genes)
+    seuratmat <- FindVariableFeatures(
+        seuratmat,
+        selection.method = 'vst',
+        # Retornar 2000 features
+        nFeatures = 3000
+    )
+    saveRDS (seuratmat, 'seurat/seuratmat.Rds')
+} else {
+    seuratmat <- readRDS ('seurat/seuratmat.Rds')
+}
+
+genes <- rownames (seuratmat)
+
+# Los 20 genes más altamente variables
+top30 <- head (VariableFeatures(seuratmat), 30)
+plot1 <- VariableFeaturePlot(seuratmat)
+plot2 <- LabelPoints(
+    plot = plot1,
+    points = top30,
+    repel = TRUE,
+    xnudge = 0,
+    ynudge = 0
+)
+plot2
+```
+
+```{R, results = 'hide'}
+# Reducción de dimensionalidad lineal (PCA)
+seuratmat <- RunPCA (seuratmat, features = VariableFeatures(object = seuratmat))
+VizDimLoadings (seuratmat, dims = 1:2, reduction = 'pca')
+```
+
+Representación de las primeras componentes principales:
+
+```{R}
+DimPlot(
+    seuratmat,
+    reduction = 'pca',
+    label = TRUE
+)
+
+DimHeatmap (seuratmat, dims = 1:2, cells = 500, balanced = TRUE)
+DimHeatmap (seuratmat, dims = 3:4, cells = 500, balanced = TRUE)
+```
+
+Desviación estándar explicada por cada componente principal:
+
+```{R}
+ElbowPlot(seuratmat)
+```
+
+```{R}
+seuratmat <- FindNeighbors (seuratmat, dims = 1:15)
+seuratmat <- FindClusters (seuratmat, resolution = 0.6)
+
+# UMAP
+if (!file.exists('seurat/seuratmat_umap.Rds')) {
+    #seuratmat_umap <- RunUMAP (seuratmat, dims = 1:10, label = TRUE)
+    seuratmat_umap <- RunUMAP (seuratmat, dims = 1:20, label = TRUE)
+    saveRDS (seuratmat_umap, 'seurat/seuratmat_umap.Rds')
+} else {
+    seuratmat_umap <- readRDS ('seurat/seuratmat_umap.Rds')
+}
+```
+
+```{R}
+DimPlot(
+    seuratmat_umap,
+    reduction = 'umap',
+    label = TRUE
+)
+```
+
+```{R}
+identidades <- unique(tipos_celulares$V1)
+names(identidades) <- levels (seuratmat_umap)
+seuratmat_renombrada <- RenameIdents(seuratmat_umap, identidades)
+seuratmat_umap <- seuratmat_renombrada
+DimPlot(
+    seuratmat_renombrada,
+    reduction = 'umap',
+    label = TRUE
+)
+rm (seuratmat_renombrada)
+gc()
+```
+
+## Encontrar genes diferencialmente expresados
+
+Primero, buscaremos los mejores de los mejores entre los genes más diferencialmente expresados de todos nuestros datos, y visualizaremos un pequeño rango de ellos.
+
+```{R}
+if (!file.exists('seurat/seuratmarkers.Rds')) {
+    seurat.markers <- FindAllMarkers (seuratmat_umap, only.pos = FALSE)
+    saveRDS (seurat.markers, 'seurat/seuratmarkers.Rds')
+} else {
+    seurat.markers <- readRDS ('seurat/seuratmarkers.Rds')
+}
+
+FeaturePlot(seuratmat_umap, features = seurat.markers$gene[1:2], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = seurat.markers$gene[3:4], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = seurat.markers$gene[5:6], min.cutoff = 'q10', max.cutoff = 'q90')
+```
+
+```{R}
+DoHeatmap (seuratmat_umap, features = seurat.markers$gene[1:30]) #+ NoLegend()
+DoHeatmap (seuratmat_umap, features = seurat.markers$gene[1:30], cells = 1:1000) #+ NoLegend()
+DoHeatmap (seuratmat_umap, features = seurat.markers$gene[1:30], cells = 1:250) #+ NoLegend()
+VlnPlot (seuratmat_umap, features = seurat.markers$gene[1:3])
+VlnPlot (seuratmat_umap, features = seurat.markers$gene[4:6])
+VlnPlot (seuratmat_umap, features = seurat.markers$gene[7:9])
+VlnPlot (seuratmat_umap, features = seurat.markers$gene[10:12])
+VlnPlot (seuratmat_umap, features = seurat.markers$gene[13:15])
+VlnPlot (seuratmat_umap, features = seurat.markers$gene[16:18])
+```
+
+## Localización de los pericitos
+
+Usando marcadores fiables: _Cox4i2, Ndufa4l2, Pdgfrb, Notch3, Vtn_.
+
+```{R}
+FeaturePlot(seuratmat_umap, features = 'Pdgfrb', min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = 'Ndufa4l2', min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = 'Cox4i2', min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = 'Notch3', min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = 'Vtn', min.cutoff = 'q10', max.cutoff = 'q90')
+
+#FeaturePlot(seuratmat_umap, features = c('Nr2f2', 'Ndufa4l2', 'Cox4i2', 'Notch3', 'Pdgfrb'), min.cutoff = 'q10', max.cutoff = 'q90', split.by = 'groups')
+```
+
+```{R}
+FeaturePlot(seuratmat_umap, features = c('Cox4i2', 'Ndufa4l2'), blend = TRUE)
+FeaturePlot(seuratmat_umap, features = c('Pdgfrb', 'Cox4i2'), blend = TRUE)
+FeaturePlot(seuratmat_umap, features = c('Pdgfrb', 'Ndufa4l2'), blend = TRUE)
+FeaturePlot(seuratmat_umap, features = c('Pdgfrb', 'Vtn'), blend = TRUE)
+FeaturePlot(seuratmat_umap, features = c('Pdgfrb', 'Notch3'), blend = TRUE)
+FeaturePlot(seuratmat_umap, features = c('Vtn', 'Notch3'), blend = TRUE)
+```
+
+```{R}
+DoHeatmap (seuratmat_umap, features = c('Ndufa4l2', 'Cox4i2', 'Notch3', 'Pdgfrb','Vtn'), cells = 1:1000) #+ NoLegend()
+VlnPlot (seuratmat_umap, features = c('Pdgfrb', 'Ndufa4l2', 'Cox4i2', 'Notch3','Vtn'))
+VlnPlot (seuratmat_umap, features = c('Zic1', 'Hic1', 'Tbx2', 'Foxd1','Mef2c'))
+#DoHeatmap (seuratmat_umap, features = VariableFeatures(seuratmat)[1:35], cells = 1:700, size = 4, angle = 90) #+ NoLegend()
+```
+
+## Hallar nuevos marcadores de pericitos
+
+En el apartado anterior, los pericitos deberían haber resaltado respecto al resto de clústers. Debemos anotar los clústers en los que han caído, pues esos clústers son los que vamos a considerar como tales y vamos a profundizar en ellos.
+
+```{R}
+# No podemos salvarnos de tener primero que mirar en qué clusters acaban los pericitos. Tras hacerlo, indicar los clústers aquí (admite vector) es suficiente
+#cluster_pericitos <- c(0,2,6)
+cluster_pericitos <- c(0,2) # No estoy seguro del clúster 6
+
+#DoHeatmap (seuratmat_umap, features = VariableFeatures(seuratmat)[1:10], cells = 1:500, size = 2, angle = 90) #+ NoLegend()
+
+#seurat.markers.pericitos <- FindMarkers (seuratmat, ident.1 = 5, logfc.threshold = 0.25, test.use = 'roc', only.pos = FALSE)
+# ORIGINAL
+#seurat.markers.pericitos <- head( FindMarkers ( seuratmat, ident.1 = cluster_pericitos), 20)
+
+marcadores_pericitos <- rownames (FindMarkers (seuratmat, ident.1 = cluster_pericitos, logfc.threshold = 0.25, test.use = 'roc', only.pos = FALSE))
+seurat.markers.pericitos <- head(marcadores_pericitos, 20)
+
+seurat.markers.pericitos
+
+regulones_filtrados <- readRDS ('output/REGULONES_FILTRADOS.Rds')
+```
+
+```{R}
+FeaturePlot(seuratmat_umap, features = marcadores_pericitos[1:2], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = marcadores_pericitos[3:4], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = marcadores_pericitos[5:6], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = marcadores_pericitos[7:8], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = marcadores_pericitos[9:10], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = marcadores_pericitos[11:12], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = marcadores_pericitos[13:14], min.cutoff = 'q10', max.cutoff = 'q90')
+
+FeaturePlot(seuratmat_umap, features = regulones_filtrados$TF[1:2], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = regulones_filtrados$TF[3:4], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = regulones_filtrados$TF[5:6], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = regulones_filtrados$TF[7:8], min.cutoff = 'q10', max.cutoff = 'q90')
+FeaturePlot(seuratmat_umap, features = regulones_filtrados$TF[9:10], min.cutoff = 'q10', max.cutoff = 'q90')
+```
+
+## Visualización de todo
+
+```{R}
+# Nuestros genes de interés
+#genes_interesantes <- c ('Ndufa4l2', 'Cox4i2', 'Pdgfrb', 'Notch3', 'Vtn')
+genes_interesantes <- c ('Ndufa4l2', 'Cox4i2')
+```
+
+Obtener los genes diana de determinados regulones.
+
+```{R}
+regulones <- loadInt (scenicOptions, 'regulons')
+head (regulones)
+```
+
+### Obtener regulones y dianas
+
+```{R}
+library(BioNERO)
+
+# Marcadores de pericitos extraídos por Seurat
+#marcadores_pericitos <- rownames (FindMarkers (seuratmat, ident.1 = cluster_pericitos))
+#marcadores_pericitos <- rownames (FindMarkers (seuratmat, ident.1 = cluster_pericitos, logfc.threshold = 0.25, test.use = 'roc', only.pos = FALSE))
+
+head(marcadores_pericitos,25)
+```
+
+```{R}
+# Matriz de correlación de SCENIC
+corrmat <- readRDS ('int/1.2_corrMat.Rds')
+
+# Linklist de grnboost
+grnboost <- readRDS ('int/1.4_GENIE3_linkList.Rds')
+
+# SCENIC 2
+regulones <- read.csv ('output/Step2_regulonTargetsInfo.tsv', sep = '\t')[, c('TF', 'gene', 'spearCor', 'CoexWeight')]
+```
+
+```{R}
+# Regulones según GRNBOOST
+grnboost_filtrado <- subset(grnboost, grnboost$Target%in%c('Ndufa4l2','Cox4i2'))
+tfs_grnboost <- grnboost_filtrado$TF
+grnboost_filtrado
+plot_grn (grnboost_filtrado[1:20,], show_labels = 'all')
+plot_grn (grnboost_filtrado, interactive = TRUE, show_labels = 'all')
+
+# Regulones según SCENIC 2
+scenic_filtrado <- subset (regulones, regulones$gene%in%c('Ndufa4l2','Cox4i2'))
+tfs_scenic <- scenic_filtrado$TF
+scenic_filtrado <- scenic_filtrado[order(-scenic_filtrado$spearCor),]
+scenic_filtrado
+plot_grn (scenic_filtrado, show_labels = 'all')
+plot_grn (scenic_filtrado, interactive = TRUE)
+
+# REGULONES FILTRADOS DEFINITIVOS
+plot_grn(regulones_filtrados, show_labels = 'all')
+```
+
+### Heatmaps
+
+```{R}
+DoHeatmap (
+    seuratmat_umap,
+    features = c(
+        rownames(seurat.markers.pericitos)[1:10],
+        genes_interesantes,
+        tfs_grnboost[1:10],
+        tfs_scenic[1:10]
+        ),
+    cells = 1:1000
+) #+ NoLegend()
+DoHeatmap (
+    seuratmat_umap,
+    features = c(
+        rownames(seurat.markers.pericitos)[1:10],
+        genes_interesantes,
+        tfs_grnboost[1:10],
+        tfs_scenic[1:10]
+        ),
+    cells = 1:250
+) #+ NoLegend()
+```
+
+```{R}
+library(ggcorrplot)
+filtrado <- corrmat[rownames(corrmat)%in%c(genes_interesantes, tfs_grnboost[1:35], tfs_scenic), colnames(corrmat)%in%c(genes_interesantes, tfs_grnboost[1:35], tfs_scenic)]
+#plot_heatmap(filtrado, type = 'expr')
+ggcorrplot(
+    filtrado,
+    title = 'Spearman Correlation Index',
+    colors = c ('red','white','green'),
+    tl.cex = 5,
+    lab = TRUE,
+    lab_size = 1,
+    tl.srt = 90,
+    pch.cex = 8
+)
+```
+
+```{R}
+tfs_definitivos <- corrmat[rownames(corrmat)%in%c('Ndufa4l2','Cox4i2', 'Zic1', 'Hic1', 'Foxd1', 'Mef2c', 'Tbx2'), colnames(corrmat)%in%c('Ndufa4l2','Cox4i2', 'Zic1', 'Hic1', 'Foxd1', 'Mef2c', 'Tbx2')]
+ggcorrplot(
+    tfs_definitivos,
+    title = 'Correlación',
+    colors = c ('red','white','green'),
+    #tl.cex = 5,
+    lab = TRUE,
+    #lab_size = 1,
+    tl.srt = 90,
+    #pch.cex = 8
+)
+```
+
+```{R}
+#regulon_names <- list(
+#    red = c(genes_interesantes),
+#    green = c(unique(tfs_grnboost)[1:5]),
+#    blue = c(unique(tfs_scenic)[1:5])
+#)
+#SCENIC::plotEmb_rgb(
+#    scenicOptions,
+#    regulon_names,
+#    aucType = 'AUC'
+#)
+#SCENIC::plotEmb_rgb(
+#    scenicOptions,
+#    regulon_names,
+#    aucType = 'Binary'
+#)
+#SCENIC::plotEmb_rgb(
+#    scenicOptions,
+#    regulones_filtrados$TF,
+#    aucType = 'AUC'
+#)
+#SCENIC::plotEmb_rgb(
+#    scenicOptions,
+#    regulones_filtrados$TF,
+#    aucType = 'Binary'
+#)
+```
+
+```{R}
+#plotEmb_rgb (
+#    scenicOptions,
+#    genes_interesantes,
+#    aucType = "AUC"
+#)
+#plotEmb_rgb (
+#    scenicOptions,
+#    tfs_grnboost[1:5],
+#    aucType = "AUC"
+#)
+#plotEmb_rgb (
+#    scenicOptions,
+#    tfs_scenic[1:5],
+#    aucType = "AUC"
+#)
+#plotEmb_rgb (
+#    scenicOptions,
+#    genes_interesantes,
+#    aucType = "Binary"
+#)
+#plotEmb_rgb (
+#    scenicOptions,
+#    tfs_grnboost[1:5],
+#    aucType = "Binary"
+#)
+#plotEmb_rgb (
+#    scenicOptions,
+#    tfs_scenic[1:5],
+#    aucType = "Binary"
+#)
+```
+
+## Gene Ontology Pathway
+
+### Rutas de nuestros factores de transcripción
+
+```{R}
+library(GOfuncR)
+
+# Nuestros TFs primero
+tfs_descubiertos <- data.frame (c('Zic1', 'Hic1', 'Tbx2', 'Mef2c', 'Foxd1'), is_candidate = 1)
+saveRDS (tfs_descubiertos, 'TFs_DESCUBIERTOS_SCENIC.Rds')
+tfs_background <- data.frame (subset(regulones, !regulones$TF%in%c(tfs_grnboost, tfs_scenic))$TF, is_candidate = 0)
+colnames (tfs_background) <- colnames (tfs_descubiertos)
+tfs_background <- rbind (tfs_descubiertos, tfs_background) # Unir tfs de interés con los background, cada uno está etiquetado como is_candidate de forma correcta
+```
+
+```{R, results = 'hide'}
+if (!file.exists('tfs_ontology.Rds')) {
+    ontology_tfs_full <- go_enrich(
+        #tfs_descubiertos,
+        tfs_background,
+        test = 'hyper', # wilcoxon, binomial, hyper
+        n_randsets = 500,
+        organismDb = 'Mus.musculus',
+        gene_len = FALSE # Para cuando la longitud del gen influya en su importancia (?)
+    )
+    saveRDS (ontology_tfs_full, 'tfs_ontology.Rds')
+} else {
+    ontology_tfs_full <- readRDS ('tfs_ontology.Rds')
+}
+```
+```{R}
+top_tfs <- ontology_tfs_full[[1]][1:nrow(ontology_tfs_full[[1]]), 'node_id']
+plot_anno_scores(
+    ontology_tfs_full,
+    head (top_tfs, 10)
+)
+tfs_anotados <- get_anno_genes(
+    as.vector(top_tfs),
+    database = 'Mus.musculus',
+    genes = as.vector (regulones$TF)
+)
+```
+```{R}
+if (!file.exists('Rutas_TFs.Rds')) {
+    rutas_tfs <- get_names (tfs_anotados$go_id)
+    rutas_tfs$genes <- tfs_anotados$gene
+    saveRDS (rutas_tfs, 'Rutas_TFs.Rds')
+} else {
+    rutas_tfs <- readRDS ('Rutas_TFs.Rds')
+}
+head(rutas_tfs, 30)
+```
+
+### Rutas de las dianas detectadas para nuestros TFs
+
+```{R, results = 'hide'}
+dianas_candidatas <- data.frame (
+    subset(regulones, regulones$TF%in%unique(tfs_grnboost, tfs_scenic))$gene,
+    is_candidate = 1
+)
+colnames (dianas_candidatas) <- c ('Diana', 'is_candidate')
+```
+```{R}
+dianas_background <- data.frame(
+    subset(regulones, !regulones$TF%in%unique(tfs_grnboost, tfs_scenic))$gene,
+    is_candidate = 0
+)
+colnames (dianas_background) <- c ('Diana', 'is_candidate')
+dianas_rutas <- rbind (dianas_candidatas, dianas_background)
+```
+
+```{R, results = 'hide'}
+ontology_dianas <- go_enrich(
+    dianas_rutas,
+    test = 'hyper', # wilcoxon, binomial, hyper
+    n_randsets = 500,
+    organismDb = 'Mus.musculus',
+    gene_len = FALSE # Para cuando la longitud del gen influya en su importancia (?)
+)
+#top_dianas <- ontology_dianas[[1]][1:100, 'node_id']
+top_dianas <- ontology_dianas[[1]][1:nrow(ontology_dianas[[1]]), 'node_id']
+head(top_dianas)
+plot_anno_scores(
+    ontology_dianas,
+    head (top_dianas, 10)
+)
+dianas_anotadas <- get_anno_genes(
+    as.vector(top_dianas),
+    database = 'Mus.musculus',
+    #genes = as.vector (regulones$gene)
+    genes = as.vector (subset(regulones, regulones$TF%in%unique(regulones$TF))$gene)
+)
+```
+
+```{R}
+#rutas_dianas <- get_names (unique(dianas_anotadas$go_id))
+#rutas_dianas$genes <- dianas_anotadas$gene
+##rutas_dianas$genes <- dianas_anotadas$gene
+#head(rutas_dianas, 100)
+#saveRDS (rutas_dianas, 'Rutas_Dianas.Rds')
+```
