@@ -1,3 +1,11 @@
+/** 
+ * Copyright (C) Adán Somoza López - All Rights Reserved
+ *
+ * Unauthorized copying of this file, via any medium is strictly prohibited
+ * Proprietary and confidential
+ * Written by Adán Somoza López <adan.somoza@estudiante.uam.es>, 28-05-2024
+ */
+
 library(Seurat)
 library(Signac)
 library(EnsDb.Mmusculus.v79) # solo para mm10
